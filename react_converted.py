@@ -14,6 +14,9 @@ from langchain_openai import ChatOpenAI
 from langchain.chat_models import AzureChatOpenAI
 from langchain.schema.runnable import RunnableLambda
 import time
+
+timing_results = []
+
 def timed(name):
     def wrapper(fn):
         def inner(x):
@@ -21,7 +24,10 @@ def timed(name):
             start = time.time()
             result = fn(x)
             end = time.time()
+            duration = end - start
             print(f"✅ [{name}] 완료 - 소요 시간: {end - start:.2f}초")
+            global timing_results
+            timing_results.append((name, duration))
             return result
         return inner
     return wrapper
@@ -30,7 +36,7 @@ def timed(name):
 os.environ["OPENAI_API_KEY"] = "sk-"
 
 # In[3]:
-df = pd.read_csv('./all_origin_updated.csv', encoding='utf-8-sig')
+df = pd.read_csv('./all_origin_updated_sam.csv', encoding='utf-8-sig')
 # In[4]:
 df.head()
 
@@ -75,172 +81,172 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
 # %%
-vectordb = FAISS.from_documents(documents, OpenAIEmbeddings())
+original_vectordb = FAISS.from_documents(documents, OpenAIEmbeddings())
 
 # In[6]:
 # 프롬프트 정의
 
-### Step 1: ICC 판단
-icc_prompt = PromptTemplate.from_template("""<Role> 당신은 제품 피드백을 읽고 분류하는 전문가입니다.
+### Step 1: ICC Classification
+icc_prompt = PromptTemplate.from_template("""<Role> You are an expert in reading and classifying product feedback.
 
-<Task>: 제품 피드백이 신규 기능 요청이나 개선 제안이면 "Proposal"로 판별합니다.  
-그렇지 않고 피드백 내용이 아래의 유형에 해당하면 ICC로 판별합니다.  
-ICC란 Issues(오류, 고장, 결함), Complaints(불만, 불편, 불쾌), Comments(단순문의, 의견)로 구성된 일반적인 문제 제기나 의견을 의미합니다.
+<Task>: If the product feedback contains new feature requests or improvement suggestions, classify it as "Suggestion".  
+Otherwise, if the feedback content falls under the following categories, classify it as ICC.  
+ICC stands for Issues (errors, failures, defects), Complaints (dissatisfaction, inconvenience, discomfort), and Comments (simple inquiries, opinions), representing general problem reports or feedback.
 
-판별 기준:
-- 피드백이 신규 기능 요청 또는 개선 제안이면: "Proposal"
-- 피드백에 아래의 단어가 포함되거나 그 의미에 해당하면: "ICC로 판별된 것으로 보여집니다"
-  - 오류
-  - 고장
-  - 결함
-  - 불만
-  - 불편
-  - 불쾌
-  - 단순문의
-  - 의견
+Classification criteria:
+- If feedback is a new feature request or improvement suggestion: "Suggestion"
+- If feedback contains or implies the following concepts: "ICC"
+  - Errors
+  - Failures
+  - Defects
+  - Complaints
+  - Inconvenience
+  - Discomfort
+  - Simple inquiries
+  - General opinions
 
-출력 형식:
-- Proposal로 판별되면: "Proposal"
-- ICC로 판별되면: "ICC"
+Output format:
+- If classified as Suggestion: "Suggestion"
+- If classified as ICC: "ICC"
 
-다른 설명이나 부가적인 텍스트는 출력하지 마세요.
+Do not include any additional explanations or supplementary text.
 
 Input Summary:
-{generated_summary}
+{afterchange}
 """)
 
+### Step 2: Suggestion Separation
+split_prompt = PromptTemplate.from_template("""<Role> You extract and organize multiple user suggestions from text. </Role>
+<Task>: Your task is to separate each distinct suggestion clearly. Identify and number each distinct suggestion in the user's summarized text.
 
-### Step 2: 제안 분리
-split_prompt = PromptTemplate.from_template("""<Role3> You extract and organize multiple user proposals from text. </Role3>
-<Task>: Your task is to separate each distinct proposal clearly. Identify and number each distinct proposal in the user’s summarized text.
-
-Reasoning: Use a Thought step to identify if the input contains more than one distinct idea (look for keywords like "and", punctuation, or multiple sentences indicating separate ideas). Then Act by listing each proposal separately in the required format. Keep each proposal phrased as a standalone improvement point.
+Reasoning: Use a Thought step to identify if the input contains more than one distinct idea (look for keywords like "and", punctuation, or multiple sentences indicating separate ideas). Then Act by listing each suggestion separately in the required format. Keep each suggestion phrased as a standalone improvement point.
 
 Text:
-{generated_summary}
+{afterchange}
 
-<Format>: If there are multiple proposals in the input, output them as a JSON array of strings, where each string is one proposal. (e.g., ["Proposal 1", "Proposal 2"]). Ensure the JSON is valid. If there is only one proposal, still output a single-element JSON array with that proposal. Do not add any explanatory text, just the JSON.""")
+<Format>: If there are multiple suggestions in the input, output them as a JSON array of strings, where each string is one suggestion. (e.g., ["Suggestion 1", "Suggestion 2"]). Ensure the JSON is valid. If there is only one suggestion, still output a single-element JSON array with that suggestion. Do not add any explanatory text, just the JSON.""")
 
-### Step 3: 첫 제안 선택
-first_prompt = PromptTemplate.from_template("""<Role4> You select the first proposal based on order of appearance. </Role4>
-<Task>: Identify and return the first proposal in the list, exactly as it is, without any additional text.
+### Step 3: Overall Suggestion Summary
+overall_summary_prompt = PromptTemplate.from_template("""
+<Role> You are a home appliance expert, specialized at summarizing electronic product suggestions comprehensively. </Role>
 
-Reasoning: Use a Thought step to parse the input list and find the first proposal in the original text. Then Act by outputting that first proposal verbatim. Do not include list markers, numbering, or any other proposals.
+<Task> Let's think step by step.
 
-Original Text: 
-{generated_summary}  
-
-List of Proposals:
-{proposals}
-
-<Format>: Output the first proposal as a plain text string (no JSON, no list formatting, no quotes around it).""")
-
-### Step 4: 제안문 generated_summary
-summary_prompt = PromptTemplate.from_template("""
-<Role> You are a home appliance expert, specialized at summarizing electronic product suggestions. </Role>
-
-<Task> Let’s think step by step.
-
-1. Understand the `{proposals}` thoroughly.
-
-2. If the suggestion is too short to summarize or lacks context, instead of asking for more context, generate the summary with the original suggestion itself. You can also use the component `{components}`.
+1. Understand all the suggestions in `{proposals}` thoroughly.
+2. For each suggestion, summarize it comprehensively while maintaining its distinctiveness and context, especially with respect to the component `{components}`.
+3. Do not merge different suggestions into one - keep them as separate suggestions if they are distinct.
 
 Strictly follow the format below. </Task>
 
 <Format> Please follow these strict output rules:
 
-- Return English text.
-- The sentence should start with "The user suggests."
-- Output must be in plain string format only.
-- Do not include any extra explanations(such as Component:, only print the summary), metadata, notes, or formatting. </Format>
+- Output must be a valid JSON array of strings.
+- The output must start with `[` and end with `]`, and contain no other text before or after.
+- Do not include any explanations, labels, metadata, or extra text.
+- Each string in the array should be a distinct summarized suggestion.
+</Format>
 """)
 
-### Step 5: 유사도 정리 (Not calling LLM)
+### Step 4: First Suggestion Selection
+first_prompt = PromptTemplate.from_template("""<Role> You select the first suggestion from the comprehensive summary based on order of appearance. </Role>
+<Task>: Identify and return the first suggestion from the comprehensive summary, exactly as it appears, without any additional text.
 
-### Step 6: Self-Consistency 판단 (구조화된 평가 기준)
+Reasoning: Use a Thought step to parse the comprehensive summary and find the first suggestion mentioned. Then Act by outputting that first suggestion verbatim. Do not include any formatting, numbering, or other suggestions.
+
+Comprehensive Summary: 
+{overall_summary}  
+
+List of Original Suggestions:
+{proposals}
+
+<Format>: Output the first Suggestion as a plain text string (no JSON, no list formatting, no quotes around it).""")
+
+### Step 5: Similarity Calculation (Not calling LLM)
+
+### Step 6: Self-Consistency Evaluation (Structured Assessment Criteria)
 sc_prompt = PromptTemplate.from_template("""
-<Role6> 당신은 제안 문장과 유사도 상위 10개의 문서를 바탕으로 가장 유사한 문서를 독립적으로 판단하는 전문가입니다. 이 과정을 총 3회 반복하여 Self-Consistency를 확보합니다. </Role6>
+<Role> You are an expert who independently evaluates the most similar document based on the Suggestion statement and top 10 similarity documents. This process will be repeated 3 times to ensure Self-Consistency. </Role>
 
-<Task>: 다음 정보를 바탕으로 가장 유사한 문서 하나를 선택하세요. 그리고 아래 항목별 점수를 반드시 숫자(정수)로 평가하고, 마지막에 판단 총점과 사고 신뢰도도 계산해 주세요.
+<Task>: Based on the following information, select the most similar document. Evaluate each criterion below with numeric scores (integers), and calculate the total evaluation score and thinking confidence at the end.
 
-[입력 정보]
-Proposal:
+[Input Information]
+Suggestion:
 {proposal_summary}
 
 Top 10 Documents:
 {top_10_table}
 
-<평가 항목>: 아래 각 항목에 대해 정량 점수로 평가하세요.
+<Evaluation Criteria>: Evaluate each criterion with quantitative scores.
 
-- 선택 문서 (Tickect_id): [예: fdff64d]
-- 기능 범주 일치성 (Context Entity Recall): [0~25점]
-- Claim 커버리지 (Context Recall): [0~25점]
-- 근거 충실도 (Faithfulness): [0~25점]
-- 설명 흐름 유사성: [0~25점]
+- Selected Document (Ticket_id): [e.g., fdff64d]
+- Functional Category Alignment (Context Entity Recall): [0-25 points]
+- Claim Coverage (Context Recall): [0-25 points]
+- Evidence Faithfulness: [0-25 points]
+- Explanation Flow Similarity: [0-25 points]
 
-<정성 평가 항목>: 판단 과정을 스스로 평가하세요.
+<Qualitative Assessment Criteria>: Self-evaluate your reasoning process.
 
-- 기준 적용 명확성: [0~30점]
-- 논리성: [0~30점]
-- 설명의 설득력: [0~20점]
-- 모호성 없음: [0~20점]
+- Clarity of Criteria Application: [0-30 points]
+- Logical Coherence: [0-30 points]
+- Persuasiveness of Explanation: [0-20 points]
+- Absence of Ambiguity: [0-20 points]
 
-- 평가 총점 합계: [위 네 항목 합계, 0~100점]
-- 사고 신뢰도(Self-Eval): [정성 평가 총점에 따라 백분율 변환]
+- Total Evaluation Score: [Sum of above four items, 0-100 points]
+- Thinking Confidence (Self-Eval): [Convert qualitative total to percentage]
 
-<출력 형식>: 아래 형식을 그대로 따르세요.
+<Output Format>: Follow the format below exactly.
 
-[1번째 응답]
-- 선택 문서: fdff61d
-- 기능 범주 일치성 (Context Entity Recall): 25점
-- Claim 커버리지: 20점
-- 근거 충실도 (Faithfulness): 24점
-- 설명 흐름 유사성: 22점
-- 평가 총점 합계: 91점
-- 기준 적용 명확성: 30점
-- 논리성: 28점
-- 설명의 설득력: 18점
-- 모호성 없음: 20점
-- 사고 신뢰도(Self-Eval): 96%
+[Response #1]
+- Selected Document: fdff61d
+- Functional Category Alignment (Context Entity Recall): 25 points
+- Claim Coverage: 20 points
+- Evidence Faithfulness: 24 points
+- Explanation Flow Similarity: 22 points
+- Total Evaluation Score: 91 points
+- Clarity of Criteria Application: 30 points
+- Logical Coherence: 28 points
+- Persuasiveness of Explanation: 18 points
+- Absence of Ambiguity: 20 points
+- Thinking Confidence (Self-Eval): 96%
 """)
 
-### Step 7: 최종 판단
-choose_prompt = PromptTemplate.from_template("""<Role7> 당신은 반복된 세 번의 판단 결과를 통합하고, 가장 신뢰도 높은 최종 추천 문서를 결정하는 전문가입니다. </Role7>
+### Step 7: Final Decision
+choose_prompt = PromptTemplate.from_template("""<Role7> You are an expert who integrates three repeated evaluation results and determines the most reliable final recommended document. </Role7>
 
-<Task>: 세 번의 Self-Consistency 기반 판단 응답과 RAG 기반 유사도 점수, RAGAS 기반 정량 지표를 함께 비교 분석하여 최종적으로 가장 유사한 문서를 하나 선정하고, 그 이유를 정리하세요.
+<Task>: Analyze the three Self-Consistency-based evaluation responses together with RAG-based similarity scores and RAGAS-based quantitative metrics to ultimately select the most similar document and explain your reasoning.
 
-Reasoning: 다음 지표들을 모두 수집하여 통합 점수를 계산한 뒤, 가장 종합적으로 유사한 문서를 선택하세요.
+Reasoning: Collect all the following metrics to calculate an integrated score, then select the most comprehensively similar document.
 
-<통합 평가 기준>
-1. Self-Consistency 평균 신뢰도 (가중치 0.3)
-2. 동일 문서 반복 선택 여부 (+10점 보정)
-3. Self-Consistency 판단 총점 평균 (가중치 0.2)
-4. RAG 기반 Cosine 유사도 (가중치 0.2)
-5. Faithfulness (RAGAS 지표) (가중치 0.15)
-6. Context Recall (RAGAS 지표) (가중치 0.15)
+<Integrated Evaluation Criteria>
+1. Self-Consistency Average Confidence (Weight 0.3)
+2. Same Document Repeated Selection (+10 point bonus)
+3. Self-Consistency Average Total Score (Weight 0.2)
+4. RAG-based Cosine Similarity (Weight 0.2)
+5. Faithfulness (RAGAS metric) (Weight 0.15)
+6. Context Recall (RAGAS metric) (Weight 0.15)
 
-<최종 선택 기준>
-- 종합 점수가 가장 높은 문서를 선택하세요.
-- 단, 동일 점수일 경우 Self-Consistency에서 더 자주 선택된 문서를 우선 고려하세요.
-- 문서 요약, 기능 목적, 설명 방식이 제안 문장과 가장 유사한지를 근거로 삼아야 합니다.
+<Final Selection Criteria>
+- Select the document with the highest integrated score.
+- In case of equal scores, prioritize documents more frequently selected in Self-Consistency.
+- The decision should be based on how similar the document summary, functional purpose, and explanation style are to the Suggestion statement.
 
-Self-Consistency 응답 목록:
+Self-Consistency Response List:
 {self_consistency_responses}
 
-RAG 유사도 목록:
+RAG Similarity List:
 {top_10_table}
 
-<Format>: 아래 형식을 따라 출력하세요.
+<Format>: Output following the format below.
 
-> ✅ 최종 추천 문서: [문서의 Ticket ID (예: d25d98b)]
-> 📄 선택된 문서 요약: [선택된 문서의 핵심 내용 요약]
-> 🔒 추천 신뢰도 (%): [0~100 사이 수치, 반복 응답과 신뢰도 평균에 기반]
-> 📊 RAG 기반 유사도 (%): [선택된 문서의 RAG 유사도, 없으면 "N/A"]
-> 🧠 선택 근거 요약:
-> - Self-Consistency 응답 중 동일 문서 반복 선택됨 (+10점)
-> - 평균 신뢰도 및 평가 총점이 가장 높음
-> - RAG 유사도 및 Faithfulness/Context Recall 점수 또한 우수
-> - 제안 문장과의 기능 목적 및 서술 방식이 가장 유사함
+> ✅ Final Recommended Document: [Document Ticket ID (e.g., d25d98b)]
+> 📄 Selected Document Summary: [Core content summary of the selected document]
+> 🔒 Recommendation Confidence (%): [0-100 numeric value, based on repeated responses and average confidence]
+> 📊 RAG-based Similarity (%): [RAG similarity of selected document, or "N/A" if not available]
+> 🧠 Selection Rationale Summary:
+> - Same document repeatedly selected in Self-Consistency responses (+10 points)
+> - Highest average confidence and evaluation scores
+> - Superior RAG similarity and Faithfulness/Context Recall scores
+> - Most similar functional purpose and narrative style to the Suggestion statement
 """)
 
 
@@ -257,7 +263,7 @@ import json
 import re
 
 def calculate_cosine_similarity(query, documents, embedding_model):
-    index = vectordb.index
+    index = original_vectordb.index
     stored_vectors = index.reconstruct_n(0, index.ntotal)
     stored_vectors_np = np.array(stored_vectors)
 
@@ -379,7 +385,7 @@ def prepare_self_consistency_input(x):
     }
 load_context = RunnableLambda(lambda _: {
     "components": inputs["components"],
-    "generated_summary": inputs["generated_summary"]
+    "afterchange": inputs["afterchange"]
 })
 
 def update_icc_df(x):
@@ -410,177 +416,124 @@ def update_icc_df(x):
     return x
 
 chain = RunnableSequence(
-    RunnableLambda(lambda x: x),  # 입력값 그대로 흘림
-
-    # Step 1: ICC 판단 (timed)
-    RunnableMap({
-        "icc_check": RunnableLambda(
-            timed("ICC 판단")(
-                lambda x: (icc_prompt | llm).invoke({"generated_summary": x["generated_summary"]}).content
-            )
-        ),
-        "components": lambda x: x["components"],
-        "generated_summary": lambda x: x["generated_summary"],
-    }),
-
-    # ICC 라벨이면 저장 후 종료, Proposal은 다음 단계 진행
-    RunnableLambda(lambda x: (
+    RunnableLambda(timed("입력받기")(lambda x: x)),
+    RunnableLambda(timed("ICC 분류")(lambda x: x | {
+        "icc_check": (icc_prompt | llm).invoke({"afterchange": x["afterchange"]}).content
+    })),
+    RunnableLambda(timed("ICC 분기처리")(lambda x: (
         (update_icc_df(x) or print("👉 판별 결과 : ICC\n <종료>") or exit(0))
     ) if x["icc_check"] == "ICC" else (
         (print("👉 판별 결과 : Proposal") or x)
-    )),
-
-    # Step 2: 제안 분리
-    RunnableMap({
-        "proposals": RunnableLambda(
-            timed("제안 분리")(
-                lambda x: (split_prompt | llm).invoke({"generated_summary": x["generated_summary"]}).content
+    ))),
+    RunnableLambda(timed("제안 분리")(lambda x: x | {
+        "proposals": (split_prompt | llm).invoke({"afterchange": x["afterchange"]}).content
+    })),
+    RunnableLambda(timed("전체 제안 요약")(lambda x: x | {
+        "proposal_summary_all": (
+            lambda response: (
+                json.loads(
+                    re.search(r"\[.*\]", response, re.DOTALL).group(0)
+                ) if re.search(r"\[.*\]", response, re.DOTALL)
+                else [response.strip()]
+            ))(
+                (lambda resp: (
+                    resp.content if hasattr(resp, "content") else str(resp)
+                ))(
+                    llm.invoke(overall_summary_prompt.format(
+                        proposals=x["proposals"],
+                        components=x["components"]
+                    ))
+                )
             )
-        ),
-        "components": lambda x: x["components"],
-        "generated_summary": lambda x: x["generated_summary"],
-    }),
-
-    # Step 3: 첫 제안 선택
-    RunnableMap({
-        "first_proposal": RunnableLambda(
-            timed("첫 제안 선택")(
-                lambda x: (first_prompt | llm).invoke({
-                    "generated_summary": x["generated_summary"],
-                    "proposals": json.dumps(x["proposals"])
-                }).content
-            )
-        ),
-        "generated_summary": lambda x: x["generated_summary"],
-        "proposals": lambda x: x["proposals"].content if hasattr(x["proposals"], "content") else x["proposals"],
-        "components": lambda x: x["components"],
-    }),
-
-    # Step 4: 제안문 요약
-    RunnableMap({
-        "proposal_summary": RunnableLambda(
-            timed("제안문 요약")(
-                lambda x: llm.invoke(summary_prompt.format(
-                    proposals=x["first_proposal"],
-                    components=x["components"]
-                )).content
-            )
-        ),
-        "first_proposal": lambda x: x["first_proposal"],
-        "components": lambda x: x["components"],
-        "generated_summary": lambda x: x["generated_summary"],
-    }),
-
-    # Step 5: 유사도 Top-10 검색
-    RunnableMap({
-        "top_10_table": RunnableLambda(
-            timed("유사도 Top-10 검색")(
-                lambda x: retrieve_context(x["proposal_summary"])[0]
-            )
-        ),
-        "top_10_docs": lambda x: retrieve_context(x["proposal_summary"])[1],
-        "top_10_records": lambda x: retrieve_context(x["proposal_summary"])[2],
-        "first_proposal": lambda x: x["first_proposal"],
-        "proposal_summary": lambda x: x["proposal_summary"],
-        "components": lambda x: x["components"],
-    }),
-
-    # Step 6: Self-consistency 판단 3회
-    RunnableMap({
-        "self_consistency_responses": RunnableLambda(
-            timed("Self-Consistency 판단 (3회 반복)")(
-                lambda x: [
-                    llm.invoke(sc_prompt.format(
-                        proposal_summary=x["proposal_summary"],
-                        top_10_table=format_top10_for_prompt(x["top_10_docs"])
-                    )) for _ in range(3)
-                ]
-            )
-        ),
-        "first_proposal": lambda x: x["first_proposal"],
-        "top_10_table": lambda x: x["top_10_table"],
-        "top_10_docs": lambda x: x["top_10_docs"],
-        "top_10_records": lambda x: x["top_10_records"],
-        "proposal_summary": lambda x: x["proposal_summary"],
-        "components": lambda x: x["components"],
-    }),
-
-    # Parse and format self_consistency_responses
-    RunnableMap({
-        "parsed_self_consistency": RunnableLambda(lambda x: [
+    })),
+    RunnableLambda(timed("첫번째 제안 선택")(lambda x: x | {
+        "first_proposal": (first_prompt | llm).invoke({
+            "overall_summary": x["proposal_summary_all"],
+            "proposals": json.dumps([x["proposal_summary_all"]])
+        }).content
+    })),
+    RunnableLambda(timed("Top-10 유사 문서 검색")(lambda x: x | {
+        "top_10_table": retrieve_context(x["first_proposal"])[0],
+        "top_10_docs": retrieve_context(x["first_proposal"])[1],
+        "top_10_records": retrieve_context(x["first_proposal"])[2]
+    })),
+    RunnableLambda(timed("Self-Consistency 평가")(lambda x: x | {
+        "self_consistency_responses": [
+            llm.invoke(sc_prompt.format(
+                proposal_summary=x["first_proposal"],
+                top_10_table=format_top10_for_prompt(x["top_10_docs"])
+            )) for _ in range(3)
+        ]
+    })),
+    RunnableLambda(timed("Self-Consistency 파싱")(lambda x: x | {
+        "parsed_self_consistency": [
             parse_self_consistency_response(resp.content if hasattr(resp, "content") else str(resp))
             for resp in x["self_consistency_responses"]
-        ]),
-        "self_consistency_responses": lambda x: x["self_consistency_responses"],
-        "top_10_table": lambda x: x["top_10_table"],
-        "first_proposal": lambda x: x["first_proposal"],
-        "top_10_docs": lambda x: x["top_10_docs"],
-        "top_10_records": lambda x: x["top_10_records"],
-        "components": lambda x: x["components"],
-    }),
-
-    RunnableMap({
-        "self_consistency_table": RunnableLambda(lambda x: format_self_consistency_table(x["parsed_self_consistency"])),
-        "self_consistency_responses": lambda x: x["self_consistency_responses"],
-        "top_10_table": lambda x: x["top_10_table"],
-        "first_proposal": lambda x: x["first_proposal"],
-        "top_10_docs": lambda x: x["top_10_docs"],
-        "top_10_records": lambda x: x["top_10_records"],
-        "components": lambda x: x["components"],
-    }),
-
-    # Step 7: 최종 판단
-    RunnableMap({
-        "final_result": RunnableLambda(
-            timed("최종 판단")(
-                lambda x: (choose_prompt | llm).invoke({
-                    "self_consistency_responses": json.dumps(
-                        [resp.content if hasattr(resp, "content") else str(resp) for resp in x["self_consistency_responses"]]
-                    ),
-                    "top_10_table": x["top_10_table"]
-                }).content
-            )
-        ),
-        "self_consistency_responses": lambda x: x["self_consistency_responses"],
-        "top_10_table": lambda x: x["top_10_table"],
-        "self_consistency_table": lambda x: x["self_consistency_table"],
-        "top_10_records": lambda x: x["top_10_records"],
-        "components": lambda x: x["components"],
-    })
+        ]
+    })),
+    RunnableLambda(timed("Self-Consistency 테이블 포맷")(lambda x: x | {
+        "self_consistency_table": format_self_consistency_table(x["parsed_self_consistency"])
+    })),
+    RunnableLambda(timed("최종 결정")(lambda x: x | {
+        "final_result": (choose_prompt | llm).invoke({
+            "self_consistency_responses": json.dumps(
+                [resp.content if hasattr(resp, "content") else str(resp) for resp in x["self_consistency_responses"]]
+            ),
+            "top_10_table": x["top_10_table"]
+        }).content
+    }))
 )
+
+
+
 
 # 모듈화: main() 함수 정의 및 반환값 구성
 def main(inputs):
+    global timing_results
+    timing_results = []
     print("\n📥 입력 제안문:")
-    print(inputs["generated_summary"])
+    print(inputs["afterchange"])
 
     result = chain.invoke(inputs)
-    print(result["final_result"])
+    print("✅ result keys:", result.keys())
 
+    print("\n📄 전체 제안 요약:")
+    print(result["proposal_summary_all"])
+
+    print("\n⭐ 첫 번째 제안:")
+    print(result["first_proposal"])
+
+    print("\n🔝 Top-10 유사 문서 테이블:")
+    print(result["top_10_table"])
+
+    print(result["final_result"])
+    
     # RAGAS 점수 추출
     import re
     final_text = result["final_result"]
-    match_ragas = re.search(r"📊 RAG 기반 유사도.*?:\s*(\d+)", final_text)
-    ragas_score = int(match_ragas.group(1)) if match_ragas else 0
+    match_ragas = re.search(r"RAG-based Similarity.*?:\s*([0-9.]+)", final_text)
+    ragas_score = float(match_ragas.group(1)) if match_ragas else 0
 
     # 선택된 문서의 ticket_id 추출
-    match_ticket = re.search(r"✅ 최종 추천 문서: \[(.*?)\]", final_text)
+    match_ticket = re.search(r"Final Recommended Document:\s*(\w+)", final_text)
     ticket_id = match_ticket.group(1) if match_ticket else ""
 
     selected_row = df[df["ticket_id_hashed"] == ticket_id]
     if not selected_row.empty:
         keyword = selected_row.iloc[0].get("keyword", "N/A")
         before_change = selected_row.iloc[0].get("before_change", "")
-        after_change = selected_row.iloc[0].get("after_change", "")
+        #after_change = selected_row.iloc[0].get("after_change", "")
+        after_change = inputs.get("afterchange", "")
     else:
         keyword = "N/A"
         before_change = ""
         after_change = ""
 
-    components = inputs["components"]
-    generated_summary = inputs["generated_summary"]
-
-    return ticket_id, components, before_change, after_change, generated_summary, ragas_score, keyword
+    components = result.get("components", inputs.get("components", ""))
+    generated_summary = result.get("first_proposal", inputs.get("generated_summary", ""))
+    proposal_summary_all = result.get("proposal_summary_all", inputs.get("proposal_summary_all", []))
+    
+    return ticket_id, components, before_change, after_change, generated_summary, ragas_score, keyword, timing_results, proposal_summary_all
 
 if __name__ == "__main__":
     main()

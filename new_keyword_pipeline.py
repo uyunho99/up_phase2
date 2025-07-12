@@ -2,8 +2,11 @@ import pandas as pd
 from langchain.schema import Document
 from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
+from sentence_transformers import SentenceTransformer
 import re
 from openai import OpenAI
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 def setup_vectordb(csv_path: str) -> FAISS:
     """
@@ -20,16 +23,16 @@ def setup_vectordb(csv_path: str) -> FAISS:
     ]
 
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vectordb = FAISS.from_documents(documents, embeddings)
+    keyword_vectordb = FAISS.from_documents(documents, embeddings)
 
-    print(f"✅ 벡터 DB 구축 완료! 저장된 문서 수: {vectordb.index.ntotal}")
-    return vectordb
+    print(f"✅ 벡터 DB 구축 완료! 저장된 문서 수: {keyword_vectordb.index.ntotal}")
+    return keyword_vectordb
 
-def search_top10_keywords(vectordb, gen_sum: str, top_k: int = 10) -> list:
+def search_top10_keywords(keyword_vectordb, gen_sum: str, top_k: int = 10) -> list:
     """
     벡터 DB에서 gen_sum 기반 Top-k 유사 키워드 검색
     """
-    results = vectordb.similarity_search(gen_sum, k=top_k)
+    results = keyword_vectordb.similarity_search(gen_sum, k=top_k)
     top10_keywords = []
     print("==== Top-10 유사 키워드 ====")
     for doc in results:
